@@ -61,6 +61,8 @@ const (
 	// dropping broadcasts. Similarly to block propagations, there's no point to queue
 	// above some healthy uncle limit, so use that.
 	maxQueuedBlockAnns = 4
+
+	handshakeTimeout = 5 * time.Second
 )
 
 var (
@@ -70,6 +72,10 @@ var (
 	headHash     common.Hash
 	headNumber   uint64
 	headTd       *big.Int = new(big.Int)
+)
+
+var (
+	syncChallengeTimeout = 15 * time.Second // Time allowance for a node to reply to the sync progress challenge
 )
 
 // func MyProtocol() p2p.Protocol {
@@ -91,7 +97,7 @@ func main() {
 	log.Root().SetHandler(log.LvlFilterHandler(log.LvlInfo, log.StreamHandler(os.Stderr, log.TerminalFormat(true))))
 	nodekey, _ := crypto.GenerateKey()
 	myConfig := p2p.Config{
-		MaxPeers:   1000,
+		MaxPeers:   10000,
 		PrivateKey: nodekey,
 		Name:       "my node name",
 		ListenAddr: ":30300",
@@ -100,6 +106,7 @@ func main() {
 		NAT:       nat.Any(),
 		// NoDiscovery: true,
 		NodeDatabase: "mynodes",
+		DialRatio:    1,
 	}
 	setBootstrapNodes(&myConfig)
 	setBootstrapNodesV5(&myConfig)
@@ -255,10 +262,10 @@ func makeProtocol(version uint) p2p.Protocol {
 }
 
 // NodeInfo retrieves some protocol metadata about the running host node.
-func fakeNodeInfo() (*eth.NodeInfo, error) {
+func fakeNodeInfo() *eth.NodeInfo {
 	if err := updateHeadfromRpc(); err != nil {
 		fmt.Println("Update head from rpc failed", "err", err)
-		return nil, err
+		return nil
 	}
 	return &eth.NodeInfo{
 		Network:    1,
@@ -266,7 +273,7 @@ func fakeNodeInfo() (*eth.NodeInfo, error) {
 		Genesis:    common.HexToHash("0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"),
 		Config:     genesis.Config,
 		Head:       common.HexToHash("0x65f5c9e2639cc2ddc7e23bd023b9fb84c5a83b3800d193eab915aa87a85eae9e"),
-	}, nil
+	}
 }
 
 // propEvent is a block propagation, waiting for its turn in the broadcast queue.
@@ -318,7 +325,7 @@ func newPeer(version int, p *p2p.Peer, rw p2p.MsgReadWriter, getPooledTx func(ha
 }
 
 func runPeer(p *peer) error {
-	p.Log().Info("Ethereum peer connected handle", "name", p.Name(), "fullID", p.Node().ID().String(), "urlv4", p.Node().URLv4())
+	p.Log().Debug("Ethereum peer connected handle", "name", p.Name(), "fullID", p.Node().ID().String(), "urlv4", p.Node().URLv4())
 	// if !p.Peer.Info().Network.Trusted {
 	// 	p.Log().Warn("Disconnected")
 	// 	return p2p.DiscTooManyPeers
@@ -330,12 +337,39 @@ func runPeer(p *peer) error {
 		p.Log().Error("Update head from rpc failed", "err", err)
 		return err
 	}
+	var blockchainForkid BlockchainForkid
 
-	if err := p.Handshake(1, headTd, headHash, genesis.Hash(), forkid.NewID(pm.blockchain), pm.forkFilter); err != nil {
+	forkID := forkid.NewID(blockchainForkid.Config(), blockchainForkid.Genesis().Hash(), blockchainForkid.CurrentHeader().Number.Uint64())
+
+	if err := p.handshake(1, headTd, headHash, genesisBlock.Hash(), forkID, forkid.NewFilter(&blockchainForkid)); err != nil {
 		p.Log().Debug("Ethereum handshake failed", "err", err)
 		return err
 	}
+	p.Log().Error("Ethereum handshake done")
 
+	// Request the peer's checkpoint header for chain height/weight validation
+	if err := p.requestHeadersByNumber(headNumber, 1, 0, false); err != nil { ////////////////// todo if else body. todo headNumber or sth else?
+		return err
+	}
+
+	// Start a timer to disconnect if the peer doesn't reply in time
+	p.syncDrop = time.AfterFunc(syncChallengeTimeout, func() {
+		p.Log().Warn("Checkpoint challenge timed out, dropping", "addr", p.RemoteAddr(), "type", p.Name())
+		// pm.removePeer(p.id)
+	})
+	// Make sure it's cleaned up if the peer dies off
+	defer func() {
+		if p.syncDrop != nil {
+			p.syncDrop.Stop()
+			p.syncDrop = nil
+		}
+	}()
+	for {
+		if err := handleMsg(p); err != nil {
+			p.Log().Debug("Ethereum message handling failed", "err", err)
+			return err
+		}
+	}
 	return nil
 }
 
@@ -381,5 +415,301 @@ func (bc *BlockchainForkid) CurrentHeader() *types.Header {
 		fmt.Println("Update head from rpc failed", "err", err)
 		return nil
 	}
-	return &types.Header{}
+	return &types.Header{
+		Difficulty: headTd,
+		Number:     new(big.Int).SetUint64(headNumber),
+	}
+}
+
+// statusData63 is the network packet for the status message for eth/63.
+type statusData63 struct {
+	ProtocolVersion uint32
+	NetworkId       uint64
+	TD              *big.Int
+	CurrentBlock    common.Hash
+	GenesisBlock    common.Hash
+}
+
+// statusData is the network packet for the status message for eth/64 and later.
+type statusData struct {
+	ProtocolVersion uint32
+	NetworkID       uint64
+	TD              *big.Int
+	Head            common.Hash
+	Genesis         common.Hash
+	ForkID          forkid.ID
+}
+
+// eth protocol message codes
+const (
+	StatusMsg          = 0x00
+	NewBlockHashesMsg  = 0x01
+	TransactionMsg     = 0x02
+	GetBlockHeadersMsg = 0x03
+	BlockHeadersMsg    = 0x04
+	GetBlockBodiesMsg  = 0x05
+	BlockBodiesMsg     = 0x06
+	NewBlockMsg        = 0x07
+	GetNodeDataMsg     = 0x0d
+	NodeDataMsg        = 0x0e
+	GetReceiptsMsg     = 0x0f
+	ReceiptsMsg        = 0x10
+
+	// New protocol message codes introduced in eth65
+	//
+	// Previously these message ids were used by some legacy and unsupported
+	// eth protocols, reown them here.
+	NewPooledTransactionHashesMsg = 0x08
+	GetPooledTransactionsMsg      = 0x09
+	PooledTransactionsMsg         = 0x0a
+)
+
+// Handshake executes the eth protocol handshake, negotiating version number,
+// network IDs, difficulties, head and genesis blocks.
+func (p *peer) handshake(network uint64, td *big.Int, head common.Hash, genesis common.Hash, forkID forkid.ID, forkFilter forkid.Filter) error {
+	// Send out own handshake in a new thread
+	errc := make(chan error, 2)
+
+	var (
+		status63 statusData63 // safe to read after two values have been received from errc
+		status   statusData   // safe to read after two values have been received from errc
+	)
+	go func() {
+		switch {
+		case p.version == eth63:
+			errc <- p2p.Send(p.rw, StatusMsg, &statusData63{
+				ProtocolVersion: uint32(p.version),
+				NetworkId:       network,
+				TD:              td,
+				CurrentBlock:    head,
+				GenesisBlock:    genesis,
+			})
+		case p.version >= eth64:
+			errc <- p2p.Send(p.rw, StatusMsg, &statusData{
+				ProtocolVersion: uint32(p.version),
+				NetworkID:       network,
+				TD:              td,
+				Head:            head,
+				Genesis:         genesis,
+				ForkID:          forkID,
+			})
+		default:
+			panic(fmt.Sprintf("unsupported eth protocol version: %d", p.version))
+		}
+	}()
+	go func() {
+		switch {
+		case p.version == eth63:
+			errc <- p.readStatusLegacy(network, &status63, genesis)
+		case p.version >= eth64:
+			errc <- p.readStatus(network, &status, genesis, forkFilter)
+		default:
+			panic(fmt.Sprintf("unsupported eth protocol version: %d", p.version))
+		}
+	}()
+	timeout := time.NewTimer(handshakeTimeout)
+	defer timeout.Stop()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errc:
+			if err != nil {
+				return err
+			}
+		case <-timeout.C:
+			return p2p.DiscReadTimeout
+		}
+	}
+	switch {
+	case p.version == eth63:
+		p.td, p.head = status63.TD, status63.CurrentBlock
+	case p.version >= eth64:
+		p.td, p.head = status.TD, status.Head
+	default:
+		panic(fmt.Sprintf("unsupported eth protocol version: %d", p.version))
+	}
+	return nil
+}
+
+func (p *peer) readStatusLegacy(network uint64, status *statusData63, genesis common.Hash) error {
+	msg, err := p.rw.ReadMsg()
+	if err != nil {
+		return err
+	}
+	if msg.Code != StatusMsg {
+		return errResp(ErrNoStatusMsg, "first msg has code %x (!= %x)", msg.Code, StatusMsg)
+	}
+	if msg.Size > protocolMaxMsgSize {
+		return errResp(ErrMsgTooLarge, "%v > %v", msg.Size, protocolMaxMsgSize)
+	}
+	// Decode the handshake and make sure everything matches
+	if err := msg.Decode(&status); err != nil {
+		return errResp(ErrDecode, "msg %v: %v", msg, err)
+	}
+	if status.GenesisBlock != genesis {
+		return errResp(ErrGenesisMismatch, "%x (!= %x)", status.GenesisBlock[:], genesis[:8])
+	}
+	if status.NetworkId != network {
+		return errResp(ErrNetworkIDMismatch, "%d (!= %d)", status.NetworkId, network)
+	}
+	if int(status.ProtocolVersion) != p.version {
+		return errResp(ErrProtocolVersionMismatch, "%d (!= %d)", status.ProtocolVersion, p.version)
+	}
+	return nil
+}
+
+func errResp(code errCode, format string, v ...interface{}) error {
+	return fmt.Errorf("%v - %v", code, fmt.Sprintf(format, v...))
+}
+
+const (
+	ErrMsgTooLarge = iota
+	ErrDecode
+	ErrInvalidMsgCode
+	ErrProtocolVersionMismatch
+	ErrNetworkIDMismatch
+	ErrGenesisMismatch
+	ErrForkIDRejected
+	ErrNoStatusMsg
+	ErrExtraStatusMsg
+)
+
+type errCode int
+
+func (p *peer) readStatus(network uint64, status *statusData, genesis common.Hash, forkFilter forkid.Filter) error {
+	msg, err := p.rw.ReadMsg()
+	if err != nil {
+		return err
+	}
+	if msg.Code != StatusMsg {
+		return errResp(ErrNoStatusMsg, "readStatus first msg has code %x (!= %x)", msg.Code, StatusMsg)
+	}
+	if msg.Size > protocolMaxMsgSize {
+		return errResp(ErrMsgTooLarge, "readStatus %v > %v", msg.Size, protocolMaxMsgSize)
+	}
+	// Decode the handshake and make sure everything matches
+	if err := msg.Decode(&status); err != nil {
+		return errResp(ErrDecode, "readStatus msg %v: %v", msg, err)
+	}
+	if status.NetworkID != network {
+		return errResp(ErrNetworkIDMismatch, "readStatus %d (!= %d)", status.NetworkID, network)
+	}
+	if int(status.ProtocolVersion) != p.version {
+		return errResp(ErrProtocolVersionMismatch, "readStatus %d (!= %d)", status.ProtocolVersion, p.version)
+	}
+	if status.Genesis != genesis {
+		return errResp(ErrGenesisMismatch, " %readStatus x (!= %x)", status.Genesis, genesis)
+	}
+	if err := forkFilter(status.ForkID); err != nil {
+		return errResp(ErrForkIDRejected, "readStatus %v", err)
+	}
+	return nil
+}
+
+func (e errCode) String() string {
+	return errorToString[int(e)]
+}
+
+// XXX change once legacy code is out
+var errorToString = map[int]string{
+	ErrMsgTooLarge:             "Message too long",
+	ErrDecode:                  "Invalid message",
+	ErrInvalidMsgCode:          "Invalid message code",
+	ErrProtocolVersionMismatch: "Protocol version mismatch",
+	ErrNetworkIDMismatch:       "Network ID mismatch",
+	ErrGenesisMismatch:         "Genesis mismatch",
+	ErrForkIDRejected:          "Fork ID rejected",
+	ErrNoStatusMsg:             "No status message",
+	ErrExtraStatusMsg:          "Extra status message",
+}
+
+// RequestHeadersByNumber fetches a batch of blocks' headers corresponding to the
+// specified header query, based on the number of an origin block.
+func (p *peer) requestHeadersByNumber(origin uint64, amount int, skip int, reverse bool) error {
+	p.Log().Debug("Fetching batch of headers", "count", amount, "fromnum", origin, "skip", skip, "reverse", reverse)
+	return p2p.Send(p.rw, GetBlockHeadersMsg, &getBlockHeadersData{Origin: hashOrNumber{Number: origin}, Amount: uint64(amount), Skip: uint64(skip), Reverse: reverse})
+}
+
+// getBlockHeadersData represents a block header query.
+type getBlockHeadersData struct {
+	Origin  hashOrNumber // Block from which to retrieve headers
+	Amount  uint64       // Maximum number of headers to retrieve
+	Skip    uint64       // Blocks to skip between consecutive headers
+	Reverse bool         // Query direction (false = rising towards latest, true = falling towards genesis)
+}
+
+// hashOrNumber is a combined field for specifying an origin block.
+type hashOrNumber struct {
+	Hash   common.Hash // Block hash from which to retrieve headers (excludes Number)
+	Number uint64      // Block hash from which to retrieve headers (excludes Hash)
+}
+
+// handleMsg is invoked whenever an inbound message is received from a remote
+// peer. The remote connection is torn down upon returning any error.
+func handleMsg(p *peer) error {
+	// Read the next message from the remote peer, and ensure it's fully consumed
+	/////////////////// < mahmoodian > ///////////////////
+	// p.Log().Info("Ethereum peer connected", "name", p.Name(), "localAddress", p.LocalAddr().String(), "remoteAddress", p.RemoteAddr().String(), "test", p.String())
+	/////////////////////////////////////////////////////
+	msg, err := p.rw.ReadMsg()
+	if err != nil {
+		return err
+	}
+	if msg.Size > protocolMaxMsgSize {
+		return errResp(ErrMsgTooLarge, "%v > %v", msg.Size, protocolMaxMsgSize)
+	}
+	defer msg.Discard()
+
+	// Handle the message depending on its contents
+	switch {
+	case msg.Code == StatusMsg:
+		////////////////// < mahmoodian > ///////////////
+		p.Log().Info("new Msg", "code", "StatusMsg")
+		/////////////////////////////////////////////////
+		// Status messages should never arrive after the handshake
+		return errResp(ErrExtraStatusMsg, "uncontrolled status message")
+
+	// Block header query, collect the requested headers and reply
+	case msg.Code == GetBlockHeadersMsg:
+		p.Log().Info("new Msg", "code", "GetBlockHeadersMsg")
+	case msg.Code == BlockHeadersMsg:
+		p.Log().Info("new Msg", "code", "BlockHeadersMsg")
+
+	case msg.Code == GetBlockBodiesMsg:
+		p.Log().Info("new Msg", "code", "GetBlockBodiesMsg")
+
+	case msg.Code == BlockBodiesMsg:
+		p.Log().Info("new Msg", "code", "BlockBodiesMsg")
+
+	case p.version >= eth63 && msg.Code == GetNodeDataMsg:
+		p.Log().Info("new Msg", "code", "GetNodeDataMsg")
+
+	case p.version >= eth63 && msg.Code == NodeDataMsg:
+		p.Log().Info("new Msg", "code", "NodeDataMsg")
+
+	case p.version >= eth63 && msg.Code == GetReceiptsMsg:
+		p.Log().Info("new Msg", "code", "GetReceiptsMsg")
+
+	case p.version >= eth63 && msg.Code == ReceiptsMsg:
+		p.Log().Info("new Msg", "code", "ReceiptsMsg")
+
+	case msg.Code == NewBlockHashesMsg:
+		p.Log().Info("new Msg", "code", "NewBlockHashesMsg")
+
+	case msg.Code == NewBlockMsg:
+		p.Log().Info("new Msg", "code", "NewBlockMsg")
+
+	case msg.Code == NewPooledTransactionHashesMsg && p.version >= eth65:
+		p.Log().Info("new Msg", "code", "NewPooledTransactionHashesMsg")
+
+	case msg.Code == GetPooledTransactionsMsg && p.version >= eth65:
+		p.Log().Info("new Msg", "code", "GetPooledTransactionsMsg")
+
+	case msg.Code == TransactionMsg || (msg.Code == PooledTransactionsMsg && p.version >= eth65):
+		p.Log().Info("new Msg", "code", "TransactionMsg || (msg.Code == PooledTransactionsMsg && p.version >= eth65)")
+
+	default:
+		p.Log().Info("new Msg", "code", "default")
+
+	}
+	return nil
 }
