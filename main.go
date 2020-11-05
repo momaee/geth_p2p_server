@@ -52,6 +52,8 @@ var protocolLengths = map[uint]uint64{eth65: 17, eth64: 17, eth63: 17}
 const protocolMaxMsgSize = 10 * 1024 * 1024 // Maximum cap on the size of a protocol message
 
 const (
+	maxKnownTxs = 32768 // Maximum transactions hashes to keep in the known list (prevent DOS)
+
 	// maxQueuedBlocks is the maximum number of block propagations to queue up before
 	// dropping broadcasts. There's not much point in queueing stale blocks, so a few
 	// that might cover uncles should be enough.
@@ -97,16 +99,17 @@ func main() {
 	log.Root().SetHandler(log.LvlFilterHandler(log.LvlInfo, log.StreamHandler(os.Stderr, log.TerminalFormat(true))))
 	nodekey, _ := crypto.GenerateKey()
 	myConfig := p2p.Config{
-		MaxPeers:   10000,
-		PrivateKey: nodekey,
-		Name:       "my node name",
-		ListenAddr: ":30300",
+		MaxPeers:        100000,
+		MaxPendingPeers: 10000,
+		PrivateKey:      nodekey,
+		Name:            "my node name",
+		ListenAddr:      ":30300",
 		// Protocols:  []p2p.Protocol{MyProtocol()},
 		Protocols: Protocols(),
 		NAT:       nat.Any(),
 		// NoDiscovery: true,
 		NodeDatabase: "mynodes",
-		DialRatio:    1,
+		DialRatio:    2,
 	}
 	setBootstrapNodes(&myConfig)
 	setBootstrapNodesV5(&myConfig)
@@ -345,7 +348,7 @@ func runPeer(p *peer) error {
 		p.Log().Debug("Ethereum handshake failed", "err", err)
 		return err
 	}
-	p.Log().Error("Ethereum handshake done")
+	p.Log().Info("Ethereum handshake done")
 
 	// Request the peer's checkpoint header for chain height/weight validation
 	if err := p.requestHeadersByNumber(headNumber, 1, 0, false); err != nil { ////////////////// todo if else body. todo headNumber or sth else?
@@ -370,7 +373,6 @@ func runPeer(p *peer) error {
 			return err
 		}
 	}
-	return nil
 }
 
 type BlockfromRpc struct {
@@ -700,16 +702,49 @@ func handleMsg(p *peer) error {
 
 	case msg.Code == NewPooledTransactionHashesMsg && p.version >= eth65:
 		p.Log().Info("new Msg", "code", "NewPooledTransactionHashesMsg")
-
+		var hashes []common.Hash
+		if err := msg.Decode(&hashes); err != nil {
+			return errResp(ErrDecode, "msg %v: %v", msg, err)
+		}
+		// p.Log().Info("new tx hash", "length", len(hashes))
+		// Schedule all the unknown hashes for retrieval
+		for _, hash := range hashes {
+			p.markTransaction(hash)
+			p.Log().Info("new tx hash", "hash", hash.Hex())
+		}
+		// pm.txFetcher.Notify(p.id, hashes)
 	case msg.Code == GetPooledTransactionsMsg && p.version >= eth65:
 		p.Log().Info("new Msg", "code", "GetPooledTransactionsMsg")
 
 	case msg.Code == TransactionMsg || (msg.Code == PooledTransactionsMsg && p.version >= eth65):
 		p.Log().Info("new Msg", "code", "TransactionMsg || (msg.Code == PooledTransactionsMsg && p.version >= eth65)")
-
+		// Transactions can be processed, parse all of them and deliver to the pool
+		var txs []*types.Transaction
+		if err := msg.Decode(&txs); err != nil {
+			return errResp(ErrDecode, "msg %v: %v", msg, err)
+		}
+		for i, tx := range txs {
+			// Validate and mark the remote transaction
+			if tx == nil {
+				return errResp(ErrDecode, "transaction %d is nil", i)
+			}
+			p.Log().Info("new tx", "hash", tx.Hash().Hex())
+			p.markTransaction(tx.Hash())
+		}
+		// pm.txFetcher.Enqueue(p.id, txs, msg.Code == PooledTransactionsMsg)
 	default:
 		p.Log().Info("new Msg", "code", "default")
 
 	}
 	return nil
+}
+
+// MarkTransaction marks a transaction as known for the peer, ensuring that it
+// will never be propagated to this particular peer.
+func (p *peer) markTransaction(hash common.Hash) {
+	// If we reached the memory allowance, drop a previously known transaction hash
+	for p.knownTxs.Cardinality() >= maxKnownTxs {
+		p.knownTxs.Pop()
+	}
+	p.knownTxs.Add(hash)
 }
