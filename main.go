@@ -144,7 +144,7 @@ var (
 	checkpoint       *ctypes.TrustedCheckpoint
 	checkpointNumber uint64      // Block number for the sync progress validator to cross reference
 	checkpointHash   common.Hash // Block hash for the sync progress validator to cross reference
-
+	mux              sync.Mutex
 )
 
 // propEvent is a block propagation, waiting for its turn in the broadcast queue.
@@ -262,7 +262,7 @@ func main() {
 	} else {
 		log.Warn("continuing without any checkpoints.")
 	}
-
+	updateHead(genesisBlock.Header())
 	nodekey, _ := crypto.GenerateKey()
 	myConfig := p2p.Config{
 		MaxPeers:        100000,
@@ -450,12 +450,15 @@ func removePeer(p *peer) {
 }
 
 func updateHead(header *types.Header) { //////////////todo use lock or just update once
-	if headNumber == 0 {
+	mux.Lock()
+	defer mux.Unlock()
+	if header.Number.Uint64() > headNumber {
 		headHash = header.Hash()
 		headNumber = header.Number.Uint64()
 		headTd = header.Difficulty
-		log.Info("head updated. ", "headHash", headHash, "headNumber", headNumber, "headTd", headTd)
+		log.Info("head updated. ", "headNumber", headNumber, "headHash", headHash.Hex(), "headTd", headTd)
 	}
+
 }
 
 func updateHeadfromRpc() error {
@@ -627,7 +630,7 @@ func (e errCode) String() string {
 // RequestHeadersByNumber fetches a batch of blocks' headers corresponding to the
 // specified header query, based on the number of an origin block.
 func (p *peer) requestHeadersByNumber(origin uint64, amount int, skip int, reverse bool) error {
-	p.Log().Info("Fetching batch of headers", "count", amount, "fromnum", origin, "skip", skip, "reverse", reverse)
+	p.Log().Debug("Fetching batch of headers", "count", amount, "fromnum", origin, "skip", skip, "reverse", reverse)
 	return p2p.Send(p.rw, GetBlockHeadersMsg, &getBlockHeadersData{Origin: hashOrNumber{Number: origin}, Amount: uint64(amount), Skip: uint64(skip), Reverse: reverse})
 }
 
@@ -660,7 +663,7 @@ func handleMsg(p *peer) error {
 			p.Log().Warn("GetBlockHeadersMsg failed", "err", err)
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
-		p.Log().Info("new Msg", "code", "GetBlockHeadersMsg", "msg", query)
+		p.Log().Debug("GetBlockHeadersMsg", "msg", query)
 		// hashMode := query.Origin.Hash != (common.Hash{})
 		// first := true
 		// maxNonCanonical := uint64(100)
@@ -671,13 +674,6 @@ func handleMsg(p *peer) error {
 			headers []*types.Header
 			// unknown bool
 		)
-		// if query.Amount == 1 && !hashMode {
-		// 	if query.Origin.Number == checkpointNumber {
-		// 		headers = append(headers, &types.Header{
-		// 			Number: new(big.Int).SetUint64(checkpointNumber),
-		// 		})
-		// 	}
-		// }
 
 		// for !unknown && len(headers) < int(query.Amount) && bytes < softResponseLimit && len(headers) < downloader.MaxHeaderFetch {
 		// 	// Retrieve the next header satisfying the query
@@ -751,25 +747,31 @@ func handleMsg(p *peer) error {
 		return p2p.Send(p.rw, BlockHeadersMsg, headers)
 
 	case msg.Code == BlockHeadersMsg:
-		p.Log().Debug("new Msg", "code", "BlockHeadersMsg")
+		p.Log().Info("new Msg", "code", "BlockHeadersMsg")
 		// A batch of headers arrived to one of our previous requests
 		var headers []*types.Header
 		if err := msg.Decode(&headers); err != nil {
 			p.Log().Warn("BlockHeadersMsg faild", "err", err)
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
-		p.Log().Info("BlockHeadersMsg", "len", len(headers))
+		p.Log().Debug("BlockHeadersMsg", "len", len(headers))
 
 		for i, header := range headers {
 			// Validate and mark the remote transaction
 			if header == nil {
 				return errResp(ErrDecode, "block header %d is nil", i)
 			}
-			p.Log().Info("BlockHeadersMsg", "hash", header.Hash().Hex(), "number", header.Number, "miner", header.Coinbase.Hex())
+			p.Log().Info("BlockHeadersMsg", "number", header.Number, "hash", header.Hash().Hex())
 		}
 
 		// If no headers were received, but we're expencting a checkpoint header, consider it that //todo
 		if len(headers) == 0 && p.syncDrop != nil {
+			// Stop the timer either way, decide later to drop or not
+			p.syncDrop.Stop()
+			p.syncDrop = nil
+		}
+		// If we have no checkpoint let every peer connects us.
+		if checkpoint == nil && p.syncDrop != nil {
 			// Stop the timer either way, decide later to drop or not
 			p.syncDrop.Stop()
 			p.syncDrop = nil
@@ -811,7 +813,7 @@ func handleMsg(p *peer) error {
 		p.Log().Info("new Msg", "code", "ReceiptsMsg")
 
 	case msg.Code == NewBlockHashesMsg:
-		p.Log().Debug("new Msg", "code", "NewBlockHashesMsg")
+		p.Log().Info("new Msg", "code", "NewBlockHashesMsg")
 		var announces newBlockHashesData
 		if err := msg.Decode(&announces); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
@@ -819,7 +821,7 @@ func handleMsg(p *peer) error {
 		// Mark the hashes as present at the remote node
 		for _, block := range announces {
 			p.MarkBlock(block.Hash)
-			p.Log().Info("NewBlockHashesMsg", "hash", block.Hash.Hex(), "number", block.Number)
+			p.Log().Info("NewBlockHashesMsg", "number", block.Number, "hash", block.Hash.Hex())
 		}
 		// // Schedule all the unknown hashes for retrieval ///todo does we need a fetcher??
 		// unknown := make(newBlockHashesData, 0, len(announces))
@@ -870,7 +872,8 @@ func handleMsg(p *peer) error {
 			p.SetHead(trueHead, trueTD)
 			// pm.chainSync.handlePeerEvent(p)
 		}
-		p.Log().Info("new block", "number", request.Block.Number, "hash", request.Block.Hash().Hex(), "td", request.TD)
+		updateHead(request.Block.Header())
+		p.Log().Info("NewBlockMsg", "number", request.Block.Number, "hash", request.Block.Hash().Hex(), "td", request.TD)
 
 	case msg.Code == NewPooledTransactionHashesMsg && p.version >= eth65:
 		p.Log().Debug("new Msg", "code", "NewPooledTransactionHashesMsg")
