@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,8 +16,10 @@ import (
 	"github.com/ethereum/go-ethereum/params/types/goethereum"
 	"github.com/ethereum/go-ethereum/params/vars"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/trie"
+	"github.com/gocql/gocql"
+
+	"./cassandra_lib"
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/ethereum/go-ethereum/common"
@@ -144,7 +145,9 @@ var (
 	checkpoint       *ctypes.TrustedCheckpoint
 	checkpointNumber uint64      // Block number for the sync progress validator to cross reference
 	checkpointHash   common.Hash // Block hash for the sync progress validator to cross reference
-	mux              sync.Mutex
+	mux              sync.Mutex  //mux for updating headData
+	cluster          *gocql.ClusterConfig
+	session          *gocql.Session
 )
 
 // propEvent is a block propagation, waiting for its turn in the broadcast queue.
@@ -243,6 +246,7 @@ type PeerInfo struct {
 }
 
 func main() {
+	var err error
 	log.Root().SetHandler(log.LvlFilterHandler(log.LvlInfo, log.StreamHandler(os.Stderr, log.TerminalFormat(true))))
 	genesisBlock = core.GenesisToBlock(genesis, nil)
 	if genesisBlock.Number().Sign() != 0 {
@@ -260,13 +264,24 @@ func main() {
 		checkpointHash = checkpoint.SectionHead
 		log.Debug("checkpoints", "checkpointNumber", checkpointNumber, "checkpointHash", checkpointHash.Hex())
 	} else {
-		log.Warn("continuing without any checkpoints.")
+		log.Warn("Continuing without any checkpoints")
 	}
 	updateHead(genesisBlock.Header())
+
+	// connect to the cluster
+	cluster = gocql.NewCluster("127.0.0.1")
+	cluster.Keyspace = "example"
+	cluster.Consistency = gocql.Quorum
+	session, err = cluster.CreateSession()
+	if err != nil {
+		log.Warn("Couldn't create cassandra session")
+	}
+	defer session.Close()
+
 	nodekey, _ := crypto.GenerateKey()
 	myConfig := p2p.Config{
 		MaxPeers:        100000,
-		MaxPendingPeers: 1000,
+		MaxPendingPeers: 100,
 		PrivateKey:      nodekey,
 		Name:            common.MakeName("Geth", "v1.9.23"),
 		ListenAddr:      ":30300",
@@ -456,30 +471,30 @@ func updateHead(header *types.Header) { //////////////todo use lock or just upda
 		headHash = header.Hash()
 		headNumber = header.Number.Uint64()
 		headTd = header.Difficulty
-		log.Info("head updated. ", "headNumber", headNumber, "headHash", headHash.Hex(), "headTd", headTd)
+		log.Debug("head updated. ", "headNumber", headNumber, "headHash", headHash.Hex(), "headTd", headTd)
 	}
 
 }
 
-func updateHeadfromRpc() error {
-	client, _ := rpc.Dial("http://192.168.1.104:8545")
-	if client == nil {
-		fmt.Println("couldn't create rpc")
-		return errors.New("could not connect to client rpc")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	var lastBlock BlockfromRpc
-	err := client.CallContext(ctx, &lastBlock, "eth_getBlockByNumber", "latest", false)
-	if err != nil {
-		fmt.Println("can't get latest block:", err)
-		return errors.New("could not get lates block")
-	}
-	headTd.SetString(lastBlock.Difficulty[2:], 16)
-	headHash = lastBlock.Hash
-	headNumber = lastBlock.Number.ToInt().Uint64()
-	return nil
-}
+// func updateHeadfromRpc() error {
+// 	client, _ := rpc.Dial("http://192.168.1.104:8545")
+// 	if client == nil {
+// 		fmt.Println("couldn't create rpc")
+// 		return errors.New("could not connect to client rpc")
+// 	}
+// 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// 	defer cancel()
+// 	var lastBlock BlockfromRpc
+// 	err := client.CallContext(ctx, &lastBlock, "eth_getBlockByNumber", "latest", false)
+// 	if err != nil {
+// 		fmt.Println("can't get latest block:", err)
+// 		return errors.New("could not get lates block")
+// 	}
+// 	headTd.SetString(lastBlock.Difficulty[2:], 16)
+// 	headHash = lastBlock.Hash
+// 	headNumber = lastBlock.Number.ToInt().Uint64()
+// 	return nil
+// }
 
 func (bc *BlockchainForkid) Config() ctypes.ChainConfigurator {
 	return genesis.Config
@@ -822,6 +837,7 @@ func handleMsg(p *peer) error {
 		for _, block := range announces {
 			p.MarkBlock(block.Hash)
 			p.Log().Info("NewBlockHashesMsg", "number", block.Number, "hash", block.Hash.Hex())
+			p.addBlockHashNumber(block.Hash, block.Number)
 		}
 		// // Schedule all the unknown hashes for retrieval ///todo does we need a fetcher??
 		// unknown := make(newBlockHashesData, 0, len(announces))
@@ -873,7 +889,8 @@ func handleMsg(p *peer) error {
 			// pm.chainSync.handlePeerEvent(p)
 		}
 		updateHead(request.Block.Header())
-		p.Log().Info("NewBlockMsg", "number", request.Block.Number, "hash", request.Block.Hash().Hex(), "td", request.TD)
+		p.Log().Info("NewBlockMsg", "number", request.Block.Number(), "hash", request.Block.Hash().Hex(), "td", request.TD)
+		p.addBlock(request.Block)
 
 	case msg.Code == NewPooledTransactionHashesMsg && p.version >= eth65:
 		p.Log().Debug("new Msg", "code", "NewPooledTransactionHashesMsg")
@@ -910,6 +927,46 @@ func handleMsg(p *peer) error {
 	default:
 		p.Log().Info("new Msg", "code", "default")
 
+	}
+	return nil
+}
+
+func (p *peer) addBlockHashNumber(hash common.Hash, number uint64) error {
+
+	if err := checkSession(); err != nil {
+		return err
+	}
+
+	if err := cassandra_lib.AddBlockHashNumber(session, hash, number); err != nil {
+		p.Log().Warn("Couldn't insert block hash into cassandra", "err", err)
+		return err
+	}
+	return nil
+}
+
+func (p *peer) addBlock(block *types.Block) error {
+	if err := checkSession(); err != nil {
+		return err
+	}
+
+	if err := cassandra_lib.AddBlock(session, block); err != nil {
+		p.Log().Warn("Couldn't insert block into cassandra", "err", err)
+		return err
+	}
+	return nil
+}
+
+func checkSession() error {
+	if session == nil {
+		var err error
+		log.Warn("Cassandra session is nil. trying to  create session")
+		session, err = cluster.CreateSession()
+		if err != nil {
+			log.Warn("Couldn't create cassandra session")
+			return err
+		}
+		log.Info("Cassandra session created.")
+		return nil
 	}
 	return nil
 }
