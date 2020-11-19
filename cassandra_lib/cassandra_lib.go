@@ -1,8 +1,8 @@
 /* Before you execute the program, Launch `cqlsh` and execute:
-create keyspace example with replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 };
-create table example.tweet(timeline text, id UUID, text text, PRIMARY KEY(id));
-create index on example.tweet(timeline);
+create keyspace eth with replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 };
+create table eth.ipaddresses(hash ascii PRIMARY KEY, ip ascii);
 */
+
 package cassandra_lib
 
 import (
@@ -16,34 +16,26 @@ import (
 	"github.com/gocql/gocql"
 )
 
-var mutex = &sync.Mutex{}
+var mutex = &sync.RWMutex{}
 
+//ErrNoSession called when session is nil
 const ErrNoSession = "Session is nil"
 
 //AddBlock adds whole block to cassandra
-func AddBlock(session *gocql.Session, block *types.Block) error {
-	if session == nil {
-		return errors.New(ErrNoSession)
-	}
-	mutex.Lock()
-	defer mutex.Unlock()
-	// insert a tweet
-	if err := session.Query(`INSERT INTO tweet (timeline, id, text) VALUES (?, ?, ?)`,
-		"me", gocql.TimeUUID(), block.Hash().Hex()).Exec(); err != nil {
-		return err
-	}
-	return nil
+func AddBlock(session *gocql.Session, block *types.Block, ip string) error {
+	return AddBlockHash(session, block.Hash(), ip)
 }
 
-func AddBlockHashNumber(session *gocql.Session, hash common.Hash, number uint64) error {
+// AddBlockHash adds block hash to cassandra
+func AddBlockHash(session *gocql.Session, hash common.Hash, ip string) error {
 	if session == nil {
 		return errors.New(ErrNoSession)
 	}
 	mutex.Lock()
 	defer mutex.Unlock()
-	// insert a tweet
-	if err := session.Query(`INSERT INTO tweet (timeline, id, text) VALUES (?, ?, ?)`,
-		"me", gocql.TimeUUID(), hash.Hex()).Exec(); err != nil {
+	// insert a hash
+	if err := session.Query(`INSERT INTO ipaddresses (hash, ip) VALUES (?, ?) IF NOT EXISTS`,
+		hash.Hex(), ip).Exec(); err != nil {
 		return err
 	}
 	return nil

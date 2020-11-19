@@ -63,6 +63,8 @@ const (
 	maxQueuedBlockAnns = 4
 
 	handshakeTimeout = 5 * time.Second
+
+	maxRecordedBlocks = maxKnownBlocks
 )
 
 // eth protocol message codes
@@ -143,11 +145,12 @@ var (
 	headNumber       uint64   = 0
 	headTd           *big.Int = new(big.Int)
 	checkpoint       *ctypes.TrustedCheckpoint
-	checkpointNumber uint64      // Block number for the sync progress validator to cross reference
-	checkpointHash   common.Hash // Block hash for the sync progress validator to cross reference
-	mux              sync.Mutex  //mux for updating headData
+	checkpointNumber uint64       // Block number for the sync progress validator to cross reference
+	checkpointHash   common.Hash  // Block hash for the sync progress validator to cross reference
+	mux              sync.RWMutex //mux for updating headData
 	cluster          *gocql.ClusterConfig
 	session          *gocql.Session
+	blocksSet        mapset.Set = mapset.NewSet()
 )
 
 // propEvent is a block propagation, waiting for its turn in the broadcast queue.
@@ -270,11 +273,11 @@ func main() {
 
 	// connect to the cluster
 	cluster = gocql.NewCluster("127.0.0.1")
-	cluster.Keyspace = "example"
+	cluster.Keyspace = "eth"
 	cluster.Consistency = gocql.Quorum
 	session, err = cluster.CreateSession()
 	if err != nil {
-		log.Warn("Couldn't create cassandra session")
+		log.Warn("Couldn't create cassandra session", "err", err)
 	}
 	defer session.Close()
 
@@ -837,7 +840,7 @@ func handleMsg(p *peer) error {
 		for _, block := range announces {
 			p.MarkBlock(block.Hash)
 			p.Log().Info("NewBlockHashesMsg", "number", block.Number, "hash", block.Hash.Hex())
-			p.addBlockHashNumber(block.Hash, block.Number)
+			p.addBlockHash(block.Hash)
 		}
 		// // Schedule all the unknown hashes for retrieval ///todo does we need a fetcher??
 		// unknown := make(newBlockHashesData, 0, len(announces))
@@ -920,7 +923,7 @@ func handleMsg(p *peer) error {
 			if tx == nil {
 				return errResp(ErrDecode, "transaction %d is nil", i)
 			}
-			p.Log().Debug("new tx", "hash", tx.Hash().Hex())
+			p.Log().Info("TransactionMsg", "hash", tx.Hash().Hex())
 			p.markTransaction(tx.Hash())
 		}
 		// pm.txFetcher.Enqueue(p.id, txs, msg.Code == PooledTransactionsMsg)
@@ -931,13 +934,22 @@ func handleMsg(p *peer) error {
 	return nil
 }
 
-func (p *peer) addBlockHashNumber(hash common.Hash, number uint64) error {
+func (p *peer) addBlockHash(hash common.Hash) error {
+	if blocksSet.Contains(hash) {
+		return nil
+	}
+
+	// If we reached the memory allowance, drop a previously blocks hash
+	for blocksSet.Cardinality() >= maxRecordedBlocks {
+		blocksSet.Pop()
+	}
+	blocksSet.Add(hash)
 
 	if err := checkSession(); err != nil {
 		return err
 	}
 
-	if err := cassandra_lib.AddBlockHashNumber(session, hash, number); err != nil {
+	if err := cassandra_lib.AddBlockHash(session, hash, p.RemoteAddr().String()); err != nil {
 		p.Log().Warn("Couldn't insert block hash into cassandra", "err", err)
 		return err
 	}
@@ -945,11 +957,21 @@ func (p *peer) addBlockHashNumber(hash common.Hash, number uint64) error {
 }
 
 func (p *peer) addBlock(block *types.Block) error {
+	if blocksSet.Contains(block.Hash()) {
+		return nil
+	}
+
+	// If we reached the memory allowance, drop a previously blocks hash
+	for blocksSet.Cardinality() >= maxRecordedBlocks {
+		blocksSet.Pop()
+	}
+	blocksSet.Add(block.Hash())
+
 	if err := checkSession(); err != nil {
 		return err
 	}
 
-	if err := cassandra_lib.AddBlock(session, block); err != nil {
+	if err := cassandra_lib.AddBlock(session, block, p.RemoteAddr().String()); err != nil {
 		p.Log().Warn("Couldn't insert block into cassandra", "err", err)
 		return err
 	}
