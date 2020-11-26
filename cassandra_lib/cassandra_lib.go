@@ -23,11 +23,23 @@ const ErrNoSession = "Session is nil"
 
 //AddBlock adds whole block to cassandra
 func AddBlock(session *gocql.Session, block *types.Block, ip string) error {
-	return AddBlockHash(session, block.Hash(), ip)
+	return addHashIP(session, block.Hash(), ip)
 }
 
 // AddBlockHash adds block hash to cassandra
 func AddBlockHash(session *gocql.Session, hash common.Hash, ip string) error {
+	return addHashIP(session, hash, ip)
+}
+
+func AddTx(session *gocql.Session, tx *types.Transaction, ip string) error {
+	return addHashIP(session, tx.Hash(), ip)
+}
+
+func AddTxHash(session *gocql.Session, hash common.Hash, ip string) error {
+	return addHashIP(session, hash, ip)
+}
+
+func addHashIP(session *gocql.Session, hash common.Hash, ip string) error {
 	if session == nil {
 		return errors.New(ErrNoSession)
 	}

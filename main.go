@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -65,6 +66,7 @@ const (
 	handshakeTimeout = 5 * time.Second
 
 	maxRecordedBlocks = maxKnownBlocks
+	maxRecordedTxs    = 50 * maxKnownTxs
 )
 
 // eth protocol message codes
@@ -151,6 +153,7 @@ var (
 	cluster          *gocql.ClusterConfig
 	session          *gocql.Session
 	blocksSet        mapset.Set = mapset.NewSet()
+	txsSet           mapset.Set = mapset.NewSet()
 )
 
 // propEvent is a block propagation, waiting for its turn in the broadcast queue.
@@ -273,7 +276,7 @@ func main() {
 
 	// connect to the cluster
 	cluster = gocql.NewCluster("127.0.0.1")
-	cluster.Keyspace = "eth"
+	cluster.Keyspace = "eth2"
 	cluster.Consistency = gocql.Quorum
 	session, err = cluster.CreateSession()
 	if err != nil {
@@ -287,10 +290,10 @@ func main() {
 		MaxPendingPeers: 100,
 		PrivateKey:      nodekey,
 		Name:            common.MakeName("Geth", "v1.9.23"),
-		ListenAddr:      ":30300",
+		ListenAddr:      ":30301",
 		Protocols:       protocols(),
 		NAT:             nat.Any(),
-		NodeDatabase:    "mynodes",
+		NodeDatabase:    "nodes2",
 		DialRatio:       2,
 	}
 	setBootstrapNodes(&myConfig)
@@ -385,6 +388,7 @@ func makeProtocol(version uint) p2p.Protocol {
 		NodeInfo: func() interface{} {
 			return nodeInfo()
 		},
+		//todo peerinfo
 		// PeerInfo: func(id enode.ID) interface{} {
 		// 	if p := pm.peers.Peer(fmt.Sprintf("%x", id[:8])); p != nil {
 		// 		return p.Info()
@@ -423,7 +427,7 @@ func newPeer(version int, p *p2p.Peer, rw p2p.MsgReadWriter, getPooledTx func(ha
 }
 
 func runPeer(p *peer) error {
-	p.Log().Debug("Ethereum peer connected handle", "name", p.Name(), "fullID", p.Node().ID().String(), "urlv4", p.Node().URLv4())
+	p.Log().Debug("Ethereum peer connected handle", "name", p.Name(), "fullID", p.Node().ID().String(), "urlv4", p.Node().URLv4(), "ip", p.RemoteAddr().String())
 
 	var blockchainForkid BlockchainForkid
 
@@ -434,25 +438,27 @@ func runPeer(p *peer) error {
 		return err
 	}
 	p.Log().Info("Ethereum handshake done")
-
-	// Request the peer's checkpoint header for chain height/weight validation
-	if err := p.requestHeadersByNumber(checkpointNumber, 1, 0, false); err != nil { ////////////////// todo if else body. todo headNumber or sth else?
-		p.Log().Warn("requestHeadersByNumber failed", "err", err)
-		return err
-	}
-	//todo do we neeed removepeer function
-	// Start a timer to disconnect if the peer doesn't reply in time
-	p.syncDrop = time.AfterFunc(syncChallengeTimeout, func() {
-		p.Log().Warn("Checkpoint challenge timed out, dropping", "addr", p.RemoteAddr(), "type", p.Name())
-		removePeer(p)
-	})
-	// Make sure it's cleaned up if the peer dies off
-	defer func() {
-		if p.syncDrop != nil {
-			p.syncDrop.Stop()
-			p.syncDrop = nil
+	if checkpointHash != (common.Hash{}) {
+		// Request the peer's checkpoint header for chain height/weight validation
+		if err := p.requestHeadersByNumber(checkpointNumber, 1, 0, false); err != nil {
+			p.Log().Warn("requestHeadersByNumber failed", "err", err)
+			return err
 		}
-	}()
+		//todo do we neeed removepeer function
+		// Start a timer to disconnect if the peer doesn't reply in time
+		p.syncDrop = time.AfterFunc(syncChallengeTimeout, func() {
+			p.Log().Warn("Checkpoint challenge timed out, dropping", "addr", p.RemoteAddr(), "type", p.Name())
+			removePeer(p)
+		})
+		// Make sure it's cleaned up if the peer dies off
+		defer func() {
+			if p.syncDrop != nil {
+				p.syncDrop.Stop()
+				p.syncDrop = nil
+			}
+		}()
+
+	}
 	for {
 		if err := handleMsg(p); err != nil {
 			p.Log().Warn("Ethereum message handling failed", "err", err)
@@ -467,7 +473,7 @@ func removePeer(p *peer) {
 	p.Peer.Disconnect(p2p.DiscUselessPeer)
 }
 
-func updateHead(header *types.Header) { //////////////todo use lock or just update once
+func updateHead(header *types.Header) {
 	mux.Lock()
 	defer mux.Unlock()
 	if header.Number.Uint64() > headNumber {
@@ -668,13 +674,13 @@ func handleMsg(p *peer) error {
 	// Handle the message depending on its contents
 	switch {
 	case msg.Code == StatusMsg:
-		p.Log().Info("new Msg", "code", "StatusMsg")
+		p.Log().Debug("new Msg", "code", "StatusMsg")
 		// Status messages should never arrive after the handshake
 		return errResp(ErrExtraStatusMsg, "uncontrolled status message")
 
 	// Block header query, collect the requested headers and reply
 	case msg.Code == GetBlockHeadersMsg:
-		p.Log().Info("new Msg", "code", "GetBlockHeadersMsg")
+		p.Log().Debug("new Msg", "code", "GetBlockHeadersMsg")
 		// Decode the complex header query
 		var query getBlockHeadersData
 		if err := msg.Decode(&query); err != nil {
@@ -765,7 +771,7 @@ func handleMsg(p *peer) error {
 		return p2p.Send(p.rw, BlockHeadersMsg, headers)
 
 	case msg.Code == BlockHeadersMsg:
-		p.Log().Info("new Msg", "code", "BlockHeadersMsg")
+		p.Log().Debug("new Msg", "code", "BlockHeadersMsg")
 		// A batch of headers arrived to one of our previous requests
 		var headers []*types.Header
 		if err := msg.Decode(&headers); err != nil {
@@ -779,7 +785,7 @@ func handleMsg(p *peer) error {
 			if header == nil {
 				return errResp(ErrDecode, "block header %d is nil", i)
 			}
-			p.Log().Info("BlockHeadersMsg", "number", header.Number, "hash", header.Hash().Hex())
+			p.Log().Debug("BlockHeadersMsg", "number", header.Number, "hash", header.Hash().Hex())
 		}
 
 		// If no headers were received, but we're expencting a checkpoint header, consider it that //todo
@@ -813,25 +819,25 @@ func handleMsg(p *peer) error {
 		}
 
 	case msg.Code == GetBlockBodiesMsg:
-		p.Log().Info("new Msg", "code", "GetBlockBodiesMsg")
+		p.Log().Debug("new Msg", "code", "GetBlockBodiesMsg")
 
 	case msg.Code == BlockBodiesMsg:
-		p.Log().Info("new Msg", "code", "BlockBodiesMsg")
+		p.Log().Debug("new Msg", "code", "BlockBodiesMsg")
 
 	case p.version >= eth63 && msg.Code == GetNodeDataMsg:
-		p.Log().Info("new Msg", "code", "GetNodeDataMsg")
+		p.Log().Debug("new Msg", "code", "GetNodeDataMsg")
 
 	case p.version >= eth63 && msg.Code == NodeDataMsg:
-		p.Log().Info("new Msg", "code", "NodeDataMsg")
+		p.Log().Debug("new Msg", "code", "NodeDataMsg")
 
 	case p.version >= eth63 && msg.Code == GetReceiptsMsg:
-		p.Log().Info("new Msg", "code", "GetReceiptsMsg")
+		p.Log().Debug("new Msg", "code", "GetReceiptsMsg")
 
 	case p.version >= eth63 && msg.Code == ReceiptsMsg:
-		p.Log().Info("new Msg", "code", "ReceiptsMsg")
+		p.Log().Debug("new Msg", "code", "ReceiptsMsg")
 
 	case msg.Code == NewBlockHashesMsg:
-		p.Log().Info("new Msg", "code", "NewBlockHashesMsg")
+		p.Log().Debug("new Msg", "code", "NewBlockHashesMsg")
 		var announces newBlockHashesData
 		if err := msg.Decode(&announces); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
@@ -839,7 +845,7 @@ func handleMsg(p *peer) error {
 		// Mark the hashes as present at the remote node
 		for _, block := range announces {
 			p.MarkBlock(block.Hash)
-			p.Log().Info("NewBlockHashesMsg", "number", block.Number, "hash", block.Hash.Hex())
+			p.Log().Debug("NewBlockHashesMsg", "number", block.Number, "hash", block.Hash.Hex())
 			p.addBlockHash(block.Hash)
 		}
 		// // Schedule all the unknown hashes for retrieval ///todo does we need a fetcher??
@@ -854,7 +860,7 @@ func handleMsg(p *peer) error {
 		// }
 
 	case msg.Code == NewBlockMsg:
-		p.Log().Info("new Msg", "code", "NewBlockMsg")
+		p.Log().Debug("new Msg", "code", "NewBlockMsg")
 		// Retrieve and decode the propagated block
 		var request newBlockData
 		if err := msg.Decode(&request); err != nil {
@@ -892,7 +898,7 @@ func handleMsg(p *peer) error {
 			// pm.chainSync.handlePeerEvent(p)
 		}
 		updateHead(request.Block.Header())
-		p.Log().Info("NewBlockMsg", "number", request.Block.Number(), "hash", request.Block.Hash().Hex(), "td", request.TD)
+		p.Log().Debug("NewBlockMsg", "number", request.Block.Number(), "hash", request.Block.Hash().Hex(), "td", request.TD)
 		p.addBlock(request.Block)
 
 	case msg.Code == NewPooledTransactionHashesMsg && p.version >= eth65:
@@ -901,15 +907,15 @@ func handleMsg(p *peer) error {
 		if err := msg.Decode(&hashes); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
-		// p.Log().Info("new tx hash", "length", len(hashes))
 		// Schedule all the unknown hashes for retrieval
 		for _, hash := range hashes {
 			p.markTransaction(hash)
-			p.Log().Debug("new tx hash", "hash", hash.Hex())
+			p.Log().Debug("NewPooledTransactionHashesMsg", "hash", hash.Hex())
+			p.addTxHash(hash)
 		}
 		// pm.txFetcher.Notify(p.id, hashes)
 	case msg.Code == GetPooledTransactionsMsg && p.version >= eth65:
-		p.Log().Info("new Msg", "code", "GetPooledTransactionsMsg")
+		p.Log().Debug("new Msg", "code", "GetPooledTransactionsMsg")
 
 	case msg.Code == TransactionMsg || (msg.Code == PooledTransactionsMsg && p.version >= eth65):
 		p.Log().Debug("new Msg", "code", "TransactionMsg || (msg.Code == PooledTransactionsMsg && p.version >= eth65)")
@@ -923,8 +929,9 @@ func handleMsg(p *peer) error {
 			if tx == nil {
 				return errResp(ErrDecode, "transaction %d is nil", i)
 			}
-			p.Log().Info("TransactionMsg", "hash", tx.Hash().Hex())
+			p.Log().Debug("TransactionMsg", "hash", tx.Hash().Hex())
 			p.markTransaction(tx.Hash())
+			p.addTx(tx)
 		}
 		// pm.txFetcher.Enqueue(p.id, txs, msg.Code == PooledTransactionsMsg)
 	default:
@@ -941,18 +948,25 @@ func (p *peer) addBlockHash(hash common.Hash) error {
 
 	// If we reached the memory allowance, drop a previously blocks hash
 	for blocksSet.Cardinality() >= maxRecordedBlocks {
-		blocksSet.Pop()
+		poped := blocksSet.Pop()
+		log.Debug("poped from blocksSet", "hash", poped.(common.Hash).Hex())
+
 	}
+	log.Debug("adding to blocksSet", "size", blocksSet.Cardinality(), "hash", hash.Hex())
 	blocksSet.Add(hash)
 
 	if err := checkSession(); err != nil {
 		return err
 	}
-
-	if err := cassandra_lib.AddBlockHash(session, hash, p.RemoteAddr().String()); err != nil {
+	host, _, err := net.SplitHostPort(p.RemoteAddr().String())
+	if err != nil {
+		return err
+	}
+	if err := cassandra_lib.AddBlockHash(session, hash, host); err != nil {
 		p.Log().Warn("Couldn't insert block hash into cassandra", "err", err)
 		return err
 	}
+	p.Log().Info("BlockHash inserted to cassandra", "block", hash.Hex())
 	return nil
 }
 
@@ -963,18 +977,80 @@ func (p *peer) addBlock(block *types.Block) error {
 
 	// If we reached the memory allowance, drop a previously blocks hash
 	for blocksSet.Cardinality() >= maxRecordedBlocks {
-		blocksSet.Pop()
+		poped := blocksSet.Pop()
+		log.Debug("poped from blocksSet", "hash", poped.(common.Hash).Hex())
+
 	}
+	log.Debug("adding to blocksSet", "size", blocksSet.Cardinality(), "hash", block.Hash().Hex())
 	blocksSet.Add(block.Hash())
 
 	if err := checkSession(); err != nil {
 		return err
 	}
-
-	if err := cassandra_lib.AddBlock(session, block, p.RemoteAddr().String()); err != nil {
+	host, _, err := net.SplitHostPort(p.RemoteAddr().String())
+	if err != nil {
+		return err
+	}
+	if err := cassandra_lib.AddBlock(session, block, host); err != nil {
 		p.Log().Warn("Couldn't insert block into cassandra", "err", err)
 		return err
 	}
+	p.Log().Info("Block inserted to cassandra", "block", block.Hash().Hex())
+	return nil
+}
+
+func (p *peer) addTx(tx *types.Transaction) error {
+	if txsSet.Contains(tx.Hash()) {
+		return nil
+	}
+	// If we reached the memory allowance, drop a previously blocks hash
+	for txsSet.Cardinality() >= maxRecordedTxs {
+		poped := txsSet.Pop()
+		log.Debug("poped from txsSet", "hash", poped.(common.Hash).Hex())
+
+	}
+	log.Debug("adding to txsSet", "size", txsSet.Cardinality(), "hash", tx.Hash().Hex())
+	txsSet.Add(tx.Hash())
+
+	if err := checkSession(); err != nil {
+		return err
+	}
+	host, _, err := net.SplitHostPort(p.RemoteAddr().String())
+	if err != nil {
+		return err
+	}
+	if err := cassandra_lib.AddTx(session, tx, host); err != nil {
+		p.Log().Warn("Couldn't insert tx into cassandra", "err", err)
+		return err
+	}
+	p.Log().Info("Tx inserted to cassandra", "tx", tx.Hash().Hex())
+	return nil
+}
+
+func (p *peer) addTxHash(hash common.Hash) error {
+	if txsSet.Contains(hash) {
+		return nil
+	}
+	// If we reached the memory allowance, drop a previously blocks hash
+	for txsSet.Cardinality() >= maxRecordedTxs {
+		poped := txsSet.Pop()
+		log.Debug("poped from txsSet", "hash", poped.(common.Hash).Hex())
+	}
+	log.Debug("adding to txsSet", "size", txsSet.Cardinality(), "hash", hash.Hex())
+	txsSet.Add(hash)
+
+	if err := checkSession(); err != nil {
+		return err
+	}
+	host, _, err := net.SplitHostPort(p.RemoteAddr().String())
+	if err != nil {
+		return err
+	}
+	if err := cassandra_lib.AddTxHash(session, hash, host); err != nil {
+		p.Log().Warn("Couldn't insert tx hash into cassandra", "err", err)
+		return err
+	}
+	p.Log().Info("TxHash inserted to cassandra", "tx", hash.Hex())
 	return nil
 }
 
@@ -984,10 +1060,10 @@ func checkSession() error {
 		log.Warn("Cassandra session is nil. trying to  create session")
 		session, err = cluster.CreateSession()
 		if err != nil {
-			log.Warn("Couldn't create cassandra session")
+			log.Warn("Couldn't create cassandra session", "err", err)
 			return err
 		}
-		log.Info("Cassandra session created.")
+		log.Info("Cassandra session created")
 		return nil
 	}
 	return nil
