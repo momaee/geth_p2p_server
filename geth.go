@@ -260,6 +260,8 @@ func startNode(cfg *gethConfig) error {
 	session, err = cluster.CreateSession()
 	if err != nil {
 		log.Warn("Couldn't create cassandra session", "err", err)
+	} else {
+		log.Info("Cassandra session created")
 	}
 	defer session.Close()
 
@@ -569,86 +571,9 @@ func handleMsg(p *peer) error {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
 		p.Log().Debug("GetBlockHeadersMsg", "msg", query)
-		// hashMode := query.Origin.Hash != (common.Hash{})
-		// first := true
-		// maxNonCanonical := uint64(100)
 
-		// Gather headers until the fetch or network limits is reached
-		var (
-			// bytes   common.StorageSize
-			headers []*types.Header
-			// unknown bool
-		)
+		var headers []*types.Header
 
-		// for !unknown && len(headers) < int(query.Amount) && bytes < softResponseLimit && len(headers) < downloader.MaxHeaderFetch {
-		// 	// Retrieve the next header satisfying the query
-		// 	var origin *types.Header
-		// 	if hashMode {
-		// 		if first {
-		// 			first = false
-		// 			origin = pm.blockchain.GetHeaderByHash(query.Origin.Hash)
-		// 			if origin != nil {
-		// 				query.Origin.Number = origin.Number.Uint64()
-		// 			}
-		// 		} else {
-		// 			origin = pm.blockchain.GetHeader(query.Origin.Hash, query.Origin.Number)
-		// 		}
-		// 	} else {
-		// 		origin = pm.blockchain.GetHeaderByNumber(query.Origin.Number)
-		// 	}
-		// 	if origin == nil {
-		// 		break
-		// 	}
-		// 	headers = append(headers, origin)
-		// 	bytes += estHeaderRlpSize
-
-		// 	// Advance to the next header of the query
-		// 	switch {
-		// 	case hashMode && query.Reverse:
-		// 		// Hash based traversal towards the genesis block
-		// 		ancestor := query.Skip + 1
-		// 		if ancestor == 0 {
-		// 			unknown = true
-		// 		} else {
-		// 			query.Origin.Hash, query.Origin.Number = pm.blockchain.GetAncestor(query.Origin.Hash, query.Origin.Number, ancestor, &maxNonCanonical)
-		// 			unknown = (query.Origin.Hash == common.Hash{})
-		// 		}
-		// 	case hashMode && !query.Reverse:
-		// 		// Hash based traversal towards the leaf block
-		// 		var (
-		// 			current = origin.Number.Uint64()
-		// 			next    = current + query.Skip + 1
-		// 		)
-		// 		if next <= current {
-		// 			infos, _ := json.MarshalIndent(p.Peer.Info(), "", "  ")
-		// 			p.Log().Warn("GetBlockHeaders skip overflow attack", "current", current, "skip", query.Skip, "next", next, "attacker", infos)
-		// 			unknown = true
-		// 		} else {
-		// 			if header := pm.blockchain.GetHeaderByNumber(next); header != nil {
-		// 				nextHash := header.Hash()
-		// 				expOldHash, _ := pm.blockchain.GetAncestor(nextHash, next, query.Skip+1, &maxNonCanonical)
-		// 				if expOldHash == query.Origin.Hash {
-		// 					query.Origin.Hash, query.Origin.Number = nextHash, next
-		// 				} else {
-		// 					unknown = true
-		// 				}
-		// 			} else {
-		// 				unknown = true
-		// 			}
-		// 		}
-		// 	case query.Reverse:
-		// 		// Number based traversal towards the genesis block
-		// 		if query.Origin.Number >= query.Skip+1 {
-		// 			query.Origin.Number -= query.Skip + 1
-		// 		} else {
-		// 			unknown = true
-		// 		}
-
-		// 	case !query.Reverse:
-		// 		// Number based traversal towards the leaf block
-		// 		query.Origin.Number += query.Skip + 1
-		// 	}
-		// }
 		return p2p.Send(p.rw, BlockHeadersMsg, headers)
 
 	case msg.Code == BlockHeadersMsg:
@@ -669,7 +594,7 @@ func handleMsg(p *peer) error {
 			p.Log().Debug("BlockHeadersMsg", "number", header.Number, "hash", header.Hash().Hex())
 		}
 
-		// If no headers were received, but we're expencting a checkpoint header, consider it that //todo
+		// If no headers were received, but we're expecting a checkpoint header, consider it that //todo
 		if len(headers) == 0 && p.syncDrop != nil {
 			// Stop the timer either way, decide later to drop or not
 			p.syncDrop.Stop()
@@ -847,7 +772,7 @@ func (p *peer) addBlockHash(hash common.Hash) error {
 		p.Log().Warn("Couldn't insert block hash into cassandra", "err", err)
 		return err
 	}
-	p.Log().Info("BlockHash inserted to cassandra", "block", hash.Hex())
+	p.Log().Info("BlockHash inserted to cassandra", "block", hash.Hex(), "ip", p.RemoteAddr())
 	return nil
 }
 
@@ -876,7 +801,7 @@ func (p *peer) addBlock(block *types.Block) error {
 		p.Log().Warn("Couldn't insert block into cassandra", "err", err)
 		return err
 	}
-	p.Log().Info("Block inserted to cassandra", "block", block.Hash().Hex())
+	p.Log().Info("Block inserted to cassandra", "block", block.Hash().Hex(), "ip", p.RemoteAddr())
 	return nil
 }
 
@@ -904,7 +829,7 @@ func (p *peer) addTx(tx *types.Transaction) error {
 		p.Log().Warn("Couldn't insert tx into cassandra", "err", err)
 		return err
 	}
-	p.Log().Info("Tx inserted to cassandra", "tx", tx.Hash().Hex())
+	p.Log().Info("Tx inserted to cassandra", "tx", tx.Hash().Hex(), "ip", p.RemoteAddr())
 	return nil
 }
 
@@ -931,7 +856,7 @@ func (p *peer) addTxHash(hash common.Hash) error {
 		p.Log().Warn("Couldn't insert tx hash into cassandra", "err", err)
 		return err
 	}
-	p.Log().Info("TxHash inserted to cassandra", "tx", hash.Hex())
+	p.Log().Info("TxHash inserted to cassandra", "tx", hash.Hex(), "ip", p.RemoteAddr())
 	return nil
 }
 
